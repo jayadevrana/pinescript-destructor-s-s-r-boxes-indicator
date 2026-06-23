@@ -1,0 +1,316 @@
+//@version=5
+indicator("Destructor’s S/R —  Boxes ", overlay = true, max_boxes_count = 500)
+
+// ─────────────────────── Inputs ───────────────────────
+number_of_boxes   = input.int(50,    "Number of boxes")
+pre_candle_from_e = input.int(1,    "Pre candles from E (to the left)")*8
+post_candle_from_e= input.int(1,    "Post candles from E (to the right)")*8
+extend_to_current = input.bool(false, "Extend all boxes to current bar")
+extend_to_next    = input.bool(true,  "Extend each box to next E")
+
+// Coloring rules
+colUpInput       = input.color(color.lime,  "Up color (Low > Prev High)")
+colDownInput     = input.color(color.red,   "Down color (High < Prev Low)")
+colNeutralInput  = input.color(color.white, "Neutral color")
+fillTransp       = input.int(85, "Fill transparency (0–100)", minval = 0, maxval = 100)
+
+// Optional: show a thin vertical line on E+1 bar
+showELine        = input.bool(true, "Mark E+1 with vertical line")
+
+// ─────────────────────── State ───────────────────────
+var box[] boxes      = array.new_box()
+var bool  forming    = false
+var int   barsLeft   = 0
+var int   leftTime   = na
+var float accHigh    = na
+var float accLow     = na
+
+// Helpers to color a box based on previous box bounds
+f_apply_color_for_bounds(b, thisLow, thisHigh) =>
+    float prevTop = na
+    float prevBot = na
+    int sz = array.size(boxes)
+    if sz >= 2
+        box prev = array.get(boxes, sz - 2)
+        prevTop := box.get_top(prev)
+        prevBot := box.get_bottom(prev)
+    color edgeCol = colNeutralInput
+    color bgCol   = color.new(colNeutralInput, fillTransp)
+    if not na(prevTop) and not na(prevBot)
+        if thisLow > prevTop
+            edgeCol := colUpInput
+            bgCol   := color.new(colUpInput, fillTransp)
+        else if thisHigh < prevBot
+            edgeCol := colDownInput
+            bgCol   := color.new(colDownInput, fillTransp)
+    box.set_border_color(b, edgeCol)
+    box.set_bgcolor(b, bgCol)
+
+hig_h = request.security(syminfo.tickerid,"D",high)
+lo_w = request.security(syminfo.tickerid,"D",low)
+
+// Compute pre-window extremes and left time (bar_time)
+f_prewindow() =>
+    float preHi = high[1]
+    float preLo = low[1]
+    if pre_candle_from_e > 0
+        for i = 2 to pre_candle_from_e + 1
+            preHi := math.max(preHi, high[i])
+            preLo := math.min(preLo, low[i])
+    int lTime = time[pre_candle_from_e + 1]
+    [preHi, preLo, lTime]
+
+// Cap the number of boxes (delete oldest)
+f_enforce_limit() =>
+    while array.size(boxes) > number_of_boxes
+        box toDel = array.shift(boxes)
+        box.delete(toDel)
+
+// ─────────────────────── Earnings trigger ───────────────────────
+eStd   = request.earnings(syminfo.tickerid, earnings.standardized)
+isE1   = ta.change(eStd)
+
+// Visual cue on E+1 (optional)
+if showELine and isE1
+    line.new(bar_index, open, bar_index, open, xloc = xloc.bar_index, style = line.style_dashed, extend = extend.both, color = color.new(color.gray, 60))
+
+// ─────────────────────── Start a new box on E+1 ───────────────────────
+if isE1 and bar_index > pre_candle_from_e + 1
+    if extend_to_next and array.size(boxes) > 0
+        box lastB = array.get(boxes, array.size(boxes) - 1)
+        box.set_right(lastB, time)
+
+    [preHi, preLo, lTime] = f_prewindow()
+    leftTime := lTime
+
+    box b = box.new(left = leftTime, top = preHi, right = time, bottom = preLo, xloc = xloc.bar_time, border_style = line.style_dashed, bgcolor = color.new(colNeutralInput, fillTransp), border_color = colNeutralInput)
+    array.push(boxes, b)
+
+    accHigh := preHi
+    accLow  := preLo
+    forming := true
+    barsLeft := math.max(0, post_candle_from_e)
+
+    accHigh := math.max(accHigh, high)
+    accLow  := math.min(accLow,  low)
+    box.set_top(b, accHigh)
+    box.set_bottom(b, accLow)
+    box.set_right(b, time)
+    f_apply_color_for_bounds(b, accLow, accHigh)
+    barsLeft := math.max(0, barsLeft - 1)
+
+// ─────────────────────── While forming, update with post bars ───────────────────────
+if forming and array.size(boxes) > 0
+    box cur = array.get(boxes, array.size(boxes) - 1)
+    if barsLeft > 0
+        accHigh := math.max(accHigh, high)
+        accLow  := math.min(accLow,  low)
+        box.set_top(cur, accHigh)
+        box.set_bottom(cur, accLow)
+        f_apply_color_for_bounds(cur, accLow, accHigh)
+        barsLeft -= 1
+        box.set_right(cur, time)
+    else
+        forming := false
+
+// ─────────────────────── Always extend LAST box to latest bar ───────────────────────
+if array.size(boxes) > 0
+    box lastB = array.get(boxes, array.size(boxes) - 1)
+    box.set_right(lastB, time)
+
+// ─────────────────────── Extend all to current if ON ───────────────────────
+if extend_to_current and array.size(boxes) > 0
+    for i = 0 to array.size(boxes) - 1
+        box.set_right(array.get(boxes, i), time)
+
+// Enforce max box count
+f_enforce_limit()
+
+
+// ─────────────────────── Export last 50 box levels ───────────────────────
+maxLevels = 50
+var float[] highs = array.new_float(maxLevels, na)
+var float[] lows  = array.new_float(maxLevels, na)
+
+// Reset arrays each bar
+for i = 0 to maxLevels - 1
+    array.set(highs, i, na)
+    array.set(lows, i, na)
+
+sz = array.size(boxes)
+if sz > 0
+    count = math.min(maxLevels, sz)
+    for i = 0 to count - 1
+        bx = array.get(boxes, sz - 1 - i)  // last box = index 0
+        array.set(highs, i, box.get_top(bx))
+        array.set(lows, i, box.get_bottom(bx))
+
+// Assign to named variables for clarity (last box = box1, etc.)
+box1_high  = array.get(highs, 0), box1_low  = array.get(lows, 0)
+box2_high  = array.get(highs, 1), box2_low  = array.get(lows, 1)
+box3_high  = array.get(highs, 2), box3_low  = array.get(lows, 2)
+// … repeat until box50
+
+// ─────────────────────── Box4 → Box40 variables ───────────────────────
+box4_high  = array.get(highs, 3),  box4_low  = array.get(lows, 3)
+box5_high  = array.get(highs, 4),  box5_low  = array.get(lows, 4)
+box6_high  = array.get(highs, 5),  box6_low  = array.get(lows, 5)
+box7_high  = array.get(highs, 6),  box7_low  = array.get(lows, 6)
+box8_high  = array.get(highs, 7),  box8_low  = array.get(lows, 7)
+box9_high  = array.get(highs, 8),  box9_low  = array.get(lows, 8)
+box10_high = array.get(highs, 9),  box10_low = array.get(lows, 9)
+box11_high = array.get(highs, 10), box11_low = array.get(lows, 10)
+box12_high = array.get(highs, 11), box12_low = array.get(lows, 11)
+box13_high = array.get(highs, 12), box13_low = array.get(lows, 12)
+box14_high = array.get(highs, 13), box14_low = array.get(lows, 13)
+box15_high = array.get(highs, 14), box15_low = array.get(lows, 14)
+box16_high = array.get(highs, 15), box16_low = array.get(lows, 15)
+box17_high = array.get(highs, 16), box17_low = array.get(lows, 16)
+box18_high = array.get(highs, 17), box18_low = array.get(lows, 17)
+box19_high = array.get(highs, 18), box19_low = array.get(lows, 18)
+box20_high = array.get(highs, 19), box20_low = array.get(lows, 19)
+box21_high = array.get(highs, 20), box21_low = array.get(lows, 20)
+box22_high = array.get(highs, 21), box22_low = array.get(lows, 21)
+box23_high = array.get(highs, 22), box23_low = array.get(lows, 22)
+box24_high = array.get(highs, 23), box24_low = array.get(lows, 23)
+box25_high = array.get(highs, 24), box25_low = array.get(lows, 24)
+box26_high = array.get(highs, 25), box26_low = array.get(lows, 25)
+box27_high = array.get(highs, 26), box27_low = array.get(lows, 26)
+box28_high = array.get(highs, 27), box28_low = array.get(lows, 27)
+box29_high = array.get(highs, 28), box29_low = array.get(lows, 28)
+box30_high = array.get(highs, 29), box30_low = array.get(lows, 29)
+box31_high = array.get(highs, 30), box31_low = array.get(lows, 30)
+box32_high = array.get(highs, 31), box32_low = array.get(lows, 31)
+box33_high = array.get(highs, 32), box33_low = array.get(lows, 32)
+box34_high = array.get(highs, 33), box34_low = array.get(lows, 33)
+box35_high = array.get(highs, 34), box35_low = array.get(lows, 34)
+box36_high = array.get(highs, 35), box36_low = array.get(lows, 35)
+box37_high = array.get(highs, 36), box37_low = array.get(lows, 36)
+box38_high = array.get(highs, 37), box38_low = array.get(lows, 37)
+box39_high = array.get(highs, 38), box39_low = array.get(lows, 38)
+box40_high = array.get(highs, 39), box40_low = array.get(lows, 39)
+
+// ─────────────────────── Plots for Box4 → Box40 ───────────────────────
+
+if ta.cross(box1_high,low) or ta.cross(box1_high,high)
+    alert("Candle Touched Box1",alert.freq_once_per_bar)
+if ta.cross(box2_high, low) or ta.cross(box2_high, high)
+    alert("Candle Touched Box2", alert.freq_once_per_bar)
+if ta.cross(box3_high, low) or ta.cross(box3_high, high)
+    alert("Candle Touched Box3", alert.freq_once_per_bar)
+if ta.cross(box4_high, low) or ta.cross(box4_high, high)
+    alert("Candle Touched Box4", alert.freq_once_per_bar)
+if ta.cross(box5_high, low) or ta.cross(box5_high, high)
+    alert("Candle Touched Box5", alert.freq_once_per_bar)
+if ta.cross(box6_high, low) or ta.cross(box6_high, high)
+    alert("Candle Touched Box6", alert.freq_once_per_bar)
+if ta.cross(box7_high, low) or ta.cross(box7_high, high)
+    alert("Candle Touched Box7", alert.freq_once_per_bar)
+if ta.cross(box8_high, low) or ta.cross(box8_high, high)
+    alert("Candle Touched Box8", alert.freq_once_per_bar)
+if ta.cross(box9_high, low) or ta.cross(box9_high, high)
+    alert("Candle Touched Box9", alert.freq_once_per_bar)
+if ta.cross(box10_high, low) or ta.cross(box10_high, high)
+    alert("Candle Touched Box10", alert.freq_once_per_bar)
+if ta.cross(box11_high, low) or ta.cross(box11_high, high)
+    alert("Candle Touched Box11", alert.freq_once_per_bar)
+if ta.cross(box12_high, low) or ta.cross(box12_high, high)
+    alert("Candle Touched Box12", alert.freq_once_per_bar)
+if ta.cross(box13_high, low) or ta.cross(box13_high, high)
+    alert("Candle Touched Box13", alert.freq_once_per_bar)
+if ta.cross(box14_high, low) or ta.cross(box14_high, high)
+    alert("Candle Touched Box14", alert.freq_once_per_bar)
+if ta.cross(box15_high, low) or ta.cross(box15_high, high)
+    alert("Candle Touched Box15", alert.freq_once_per_bar)
+if ta.cross(box16_high, low) or ta.cross(box16_high, high)
+    alert("Candle Touched Box16", alert.freq_once_per_bar)
+if ta.cross(box17_high, low) or ta.cross(box17_high, high)
+    alert("Candle Touched Box17", alert.freq_once_per_bar)
+if ta.cross(box18_high, low) or ta.cross(box18_high, high)
+    alert("Candle Touched Box18", alert.freq_once_per_bar)
+if ta.cross(box19_high, low) or ta.cross(box19_high, high)
+    alert("Candle Touched Box19", alert.freq_once_per_bar)
+if ta.cross(box20_high, low) or ta.cross(box20_high, high)
+    alert("Candle Touched Box20", alert.freq_once_per_bar)
+
+if ta.cross(box21_high, low) or ta.cross(box21_high, high)
+    alert("Candle Touched Box21", alert.freq_once_per_bar)
+if ta.cross(box22_high, low) or ta.cross(box22_high, high)
+    alert("Candle Touched Box22", alert.freq_once_per_bar)
+if ta.cross(box23_high, low) or ta.cross(box23_high, high)
+    alert("Candle Touched Box23", alert.freq_once_per_bar)
+if ta.cross(box24_high, low) or ta.cross(box24_high, high)
+    alert("Candle Touched Box24", alert.freq_once_per_bar)
+if ta.cross(box25_high, low) or ta.cross(box25_high, high)
+    alert("Candle Touched Box25", alert.freq_once_per_bar)
+if ta.cross(box26_high, low) or ta.cross(box26_high, high)
+    alert("Candle Touched Box26", alert.freq_once_per_bar)
+if ta.cross(box27_high, low) or ta.cross(box27_high, high)
+    alert("Candle Touched Box27", alert.freq_once_per_bar)
+if ta.cross(box28_high, low) or ta.cross(box28_high, high)
+    alert("Candle Touched Box28", alert.freq_once_per_bar)
+if ta.cross(box29_high, low) or ta.cross(box29_high, high)
+    alert("Candle Touched Box29", alert.freq_once_per_bar)
+if ta.cross(box30_high, low) or ta.cross(box30_high, high)
+    alert("Candle Touched Box30", alert.freq_once_per_bar)
+if ta.cross(box31_high, low) or ta.cross(box31_high, high)
+    alert("Candle Touched Box31", alert.freq_once_per_bar)
+if ta.cross(box32_high, low) or ta.cross(box32_high, high)
+    alert("Candle Touched Box32", alert.freq_once_per_bar)
+if ta.cross(box33_high, low) or ta.cross(box33_high, high)
+    alert("Candle Touched Box33", alert.freq_once_per_bar)
+if ta.cross(box34_high, low) or ta.cross(box34_high, high)
+    alert("Candle Touched Box34", alert.freq_once_per_bar)
+if ta.cross(box35_high, low) or ta.cross(box35_high, high)
+    alert("Candle Touched Box35", alert.freq_once_per_bar)
+if ta.cross(box36_high, low) or ta.cross(box36_high, high)
+    alert("Candle Touched Box36", alert.freq_once_per_bar)
+if ta.cross(box37_high, low) or ta.cross(box37_high, high)
+    alert("Candle Touched Box37", alert.freq_once_per_bar)
+if ta.cross(box38_high, low) or ta.cross(box38_high, high)
+    alert("Candle Touched Box38", alert.freq_once_per_bar)
+if ta.cross(box39_high, low) or ta.cross(box39_high, high)
+    alert("Candle Touched Box39", alert.freq_once_per_bar)
+if ta.cross(box40_high, low) or ta.cross(box40_high, high)
+    alert("Candle Touched Box40", alert.freq_once_per_bar)
+// // Example: plot last 5 box highs/lows
+// plot(box1_high, "Box1 High", color=color.lime)
+// plot(box1_low,  "Box1 Low",  color=color.red)
+// plot(box2_high, "Box2 High", color=color.lime)
+// plot(box2_low,  "Box2 Low",  color=color.red)
+// plot(box3_high, "Box3 High", color=color.lime)
+// plot(box3_low,  "Box3 Low",  color=color.red)
+// plot(box4_high,  "Box4 High",  color=color.lime)
+// plot(box4_low,   "Box4 Low",   color=color.red)
+// plot(box5_high,  "Box5 High",  color=color.lime)
+// plot(box5_low,   "Box5 Low",   color=color.red)
+// plot(box6_high,  "Box6 High",  color=color.lime)
+// plot(box6_low,   "Box6 Low",   color=color.red)
+// plot(box7_high,  "Box7 High",  color=color.lime)
+// plot(box7_low,   "Box7 Low",   color=color.red)
+// plot(box8_high,  "Box8 High",  color=color.lime)
+// plot(box8_low,   "Box8 Low",   color=color.red)
+// plot(box9_high,  "Box9 High",  color=color.lime)
+// plot(box9_low,   "Box9 Low",   color=color.red)
+// plot(box10_high, "Box10 High", color=color.lime)
+// plot(box10_low,  "Box10 Low",  color=color.red)
+// plot(box11_high, "Box11 High", color=color.lime)
+// plot(box11_low,  "Box11 Low",  color=color.red)
+// plot(box12_high, "Box12 High", color=color.lime)
+// plot(box12_low,  "Box12 Low",  color=color.red)
+// plot(box13_high, "Box13 High", color=color.lime)
+// plot(box13_low,  "Box13 Low",  color=color.red)
+// plot(box14_high, "Box14 High", color=color.lime)
+// plot(box14_low,  "Box14 Low",  color=color.red)
+// plot(box15_high, "Box15 High", color=color.lime)
+// plot(box15_low,  "Box15 Low",  color=color.red)
+// plot(box16_high, "Box16 High", color=color.lime)
+// plot(box16_low,  "Box16 Low",  color=color.red)
+// plot(box17_high, "Box17 High", color=color.lime)
+// plot(box17_low,  "Box17 Low",  color=color.red)
+// plot(box18_high, "Box18 High", color=color.lime)
+// plot(box18_low,  "Box18 Low",  color=color.red)
+// plot(box19_high, "Box19 High", color=color.lime)
+// plot(box19_low,  "Box19 Low",  color=color.red)
+// plot(box20_high, "Box20 High", color=color.lime)
+// plot(box20_low,  "Box20 Low",  color=color.red)
